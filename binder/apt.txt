@@ -1,1 +1,2 @@
-libxgboost
+libatlas-dev
+libatlas3gf

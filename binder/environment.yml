@@ -11,6 +11,6 @@ dependencies:
   - transformers
   - matplotlib
   - seaborn
-  - xgboost
+  - py-xgboost-cpu
 
   
