@@ -1,0 +1,16 @@
+name: shap-binderized
+channels:
+  - conda-forge
+
+dependencies:
+  - shap
+  - numpy<=2.1
+  - pytorch
+  - pandas
+  - datasets
+  - transformers
+  - matplotlib
+  - seaborn
+  - xgboost
+
+  

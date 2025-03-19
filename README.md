@@ -9,7 +9,7 @@
 [![Conda](https://img.shields.io/conda/vn/conda-forge/shap)](https://anaconda.org/conda-forge/shap)
 ![License](https://img.shields.io/github/license/shap/shap)
 ![Tests](https://github.com/shap/shap/actions/workflows/run_tests.yml/badge.svg)
-[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/shap/shap/master)
+[![Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/fomightez/shap/HEAD?urlpath=%2Fdoc%2Ftree%2Fnotebooks%2Fapi_examples%2Fplots%2Fwaterfall.ipynb)
 [![Documentation Status](https://readthedocs.org/projects/shap/badge/?version=latest)](https://shap.readthedocs.io/en/latest/?badge=latest)
 ![Downloads](https://img.shields.io/pypi/dm/shap)
 [![PyPI pyversions](https://img.shields.io/pypi/pyversions/shap)](https://pypi.org/pypi/shap/)
