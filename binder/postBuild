@@ -7,6 +7,6 @@
 # 1. Update `notebooks/text_examples/sentiment_analysis/Emotion%20classification%20multiclass%20example.ipynb` to 
 # address that cuda won't be available in MyBinder session
 sed -i 's/).cuda()/)/g' ~/notebooks/text_examples/sentiment_analysis/Emotion\ classification\ multiclass\ example.ipynb
-# 2.limit the list of strings for which to explain the classifications SO THAT RUNS IN REASONABLE AMOUNT OF TIME ON 
+# 2.limit the list of strings for which to explain the classifications SO THAT THE CODE RUNS IN REASONABLE AMOUNT OF TIME ON 
 # MYBINDER-served session.
 sed -i 's/][:3])/][:1])/g' ~/notebooks/text_examples/sentiment_analysis/Emotion\ classification\ multiclass\ example.ipynb
