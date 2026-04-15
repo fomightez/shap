@@ -31,6 +31,14 @@ pip install shap
 conda install -c conda-forge shap
 </pre>
 
+## Supported versions
+
+SHAP follows [SPEC 0](https://scientific-python.org/specs/spec-0000/) for minimum supported dependency versions. We test against the versions specified there and may not fix bugs for older versions.
+
+## Contributing
+
+We welcome contributions highly. Feel free to file an issue. Before opening a PR make sure you've read our [CONTRIBUTING.md](CONTRIBUTING.md) guideline.
+
 ## Tree ensemble example (XGBoost/LightGBM/CatBoost/scikit-learn/pyspark models)
 
 While SHAP can explain the output of any machine learning model, we have developed a high-speed exact algorithm for tree ensemble methods (see our [Nature MI paper](https://rdcu.be/b0z70)). Fast C++ implementations are supported for *XGBoost*, *LightGBM*, *CatBoost*, *scikit-learn* and *pyspark* tree models:
@@ -90,7 +98,7 @@ shap.plots.scatter(shap_values[:, "Latitude"], color=shap_values)
 </p>
 
 
-To get an overview of which features are most important for a model we can plot the SHAP values of every feature for every sample. The plot below sorts features by the sum of SHAP value magnitudes over all samples, and uses SHAP values to show the distribution of the impacts each feature has on the model output. The color represents the feature value (red high, blue low). This reveals for example that higher median incomes improves the predicted home price.
+To get an overview of which features are most important for a model we can plot the SHAP values of every feature for every sample. The plot below sorts features by the sum of SHAP value magnitudes over all samples, and uses SHAP values to show the distribution of the impacts each feature has on the model output. The color represents the feature value (red high, blue low). This reveals for example that higher median incomes increases the predicted home price.
 
 ```python
 # summarize the effects of all the features
@@ -120,7 +128,7 @@ import transformers
 import shap
 
 # load a transformers pipeline model
-model = transformers.pipeline('sentiment-analysis', return_all_scores=True)
+model = transformers.pipeline('sentiment-analysis', top_k=None)
 
 # explain the model on two sample inputs
 explainer = shap.Explainer(model)

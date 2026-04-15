@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import ast
 import io
 import json
 import os
 import time
 import warnings
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
+import numpy.typing as npt
 import pandas as pd
 import scipy.sparse
 import scipy.special
@@ -24,6 +26,7 @@ from ..utils._exceptions import (
     InvalidModelError,
 )
 from ..utils._legacy import DenseData
+from ..utils._warnings import ExperimentalWarning
 from ._explainer import Explainer
 from .other._ubjson import decode_ubjson_buffer
 
@@ -53,7 +56,42 @@ feature_perturbation_codes = {
 }
 
 
-def _check_xgboost_version(v: str):
+def _safe_check_tree_instance_experimental(tree_instance: Any) -> None:
+    """
+    This function checks if a tree instance has an experimental integration with shap TreeExplainer class.
+
+    To add experimental message support for your library add package name and its versions
+    verified to be used with shap to the 'experimental' dictionary below.
+
+    Parameters
+    ----------
+    tree_instance: object, tree instance from an external library
+    """
+    experimental = {
+        "causalml": "0.15.3",
+    }
+
+    safe_instance = None
+    if hasattr(tree_instance, "__class__"):
+        if hasattr(tree_instance.__class__, "__module__"):
+            safe_instance = tree_instance
+
+    if safe_instance:
+        library = safe_instance.__class__.__module__.split(".")[0]
+        if experimental.get(library):
+            warnings.warn(
+                f"You are using experimental integration with {library}. "
+                f"The {library} support is verified for the following versions: {experimental.get(library)}. "
+                f"As experimental functionality, this integration may be removed or significantly changed in future releases without following semantic versioning. Use in production systems at your own risk.",
+                ExperimentalWarning,
+            )
+    else:
+        warnings.warn(
+            f"Unable to check experimental integration status for {tree_instance} object", ExperimentalWarning
+        )
+
+
+def _check_xgboost_version(v: str) -> None:
     if version.parse(v) < version.parse("1.6"):  # pragma: no cover
         raise RuntimeError(f"SHAP requires XGBoost >= v1.6 , but found version {v}. Please upgrade XGBoost.")
 
@@ -66,7 +104,7 @@ def _xgboost_n_iterations(tree_limit: int, num_stacked_models: int) -> int:
     return n_iterations
 
 
-def _xgboost_cat_unsupported(model):
+def _xgboost_cat_unsupported(model: TreeEnsemble) -> None:
     if model.model_type == "xgboost" and model.cat_feature_indices is not None:
         raise NotImplementedError(
             "Categorical split is not yet supported. You can still use"
@@ -88,18 +126,26 @@ class TreeExplainer(Explainer):
 
     """
 
+    data: npt.NDArray[Any] | None
+    data_missing: npt.NDArray[np.bool_] | None
+    feature_perturbation: str
+    expected_value: Any
+    model: TreeEnsemble
+    model_output: str
+    data_feature_names: list[str]
+
     def __init__(
         self,
-        model,
-        data=None,
-        model_output="raw",
-        feature_perturbation="auto",
-        feature_names=None,
-        approximate=DEPRECATED_APPROX,
+        model: Any,
+        data: npt.NDArray[Any] | pd.DataFrame | None = None,
+        model_output: str = "raw",
+        feature_perturbation: Literal["auto", "interventional", "tree_path_dependent"] = "auto",
+        feature_names: list[str] | None = None,
+        approximate: Any = DEPRECATED_APPROX,
         # FIXME: The `link` and `linearize_link` arguments are ignored. GH #3513
-        link=None,
-        linearize_link=None,
-    ):
+        link: Any = None,
+        linearize_link: Any = None,
+    ) -> None:
         """Build a new Tree explainer for the passed model.
 
         Parameters
@@ -233,6 +279,9 @@ class TreeExplainer(Explainer):
                 "using shap.sample(data, 100) to create a smaller background data set."
             )
             warnings.warn(wmsg)
+
+        _safe_check_tree_instance_experimental(model)
+
         self.data_missing = None if self.data is None else pd.isna(self.data)
         self.feature_perturbation = feature_perturbation
         self.expected_value = None
@@ -269,7 +318,7 @@ class TreeExplainer(Explainer):
             self.expected_value = self.__dynamic_expected_value
         elif data is not None:
             try:
-                self.expected_value = self.model.predict(self.data).mean(0)
+                self.expected_value = self.model.predict(self.data).mean(0)  # type: ignore[union-attr]
             except ValueError:
                 raise ExplainerError(
                     "Currently TreeExplainer can only handle models with categorical splits when "
@@ -290,9 +339,9 @@ class TreeExplainer(Explainer):
         if self.model.model_output == "probability_doubled" and self.expected_value is not None:
             self.expected_value = [1 - self.expected_value, self.expected_value]
 
-    def __dynamic_expected_value(self, y):
+    def __dynamic_expected_value(self, y: npt.NDArray[Any]) -> npt.NDArray[Any]:
         """This computes the expected value conditioned on the given label value."""
-        return self.model.predict(self.data, np.ones(self.data.shape[0]) * y).mean(0)
+        return self.model.predict(self.data, np.ones(self.data.shape[0]) * y).mean(0)  # type: ignore[union-attr]
 
     def __call__(  # type: ignore
         self,
@@ -392,16 +441,22 @@ class TreeExplainer(Explainer):
             compute_time=time.time() - start_time,
         )
 
-    def _validate_inputs(self, X, y, tree_limit, check_additivity):
+    def _validate_inputs(
+        self,
+        X: npt.NDArray[Any] | pd.Series | pd.DataFrame,
+        y: npt.NDArray[Any] | pd.Series | None,
+        tree_limit: int | None,
+        check_additivity: bool,
+    ) -> tuple[npt.NDArray[Any], npt.NDArray[Any] | pd.Series | None, npt.NDArray[np.bool_], bool, int, bool]:
         # see if we have a default tree_limit in place.
         if tree_limit is None:
             tree_limit = -1 if self.model.tree_limit is None else self.model.tree_limit
 
         if tree_limit < 0 or tree_limit > self.model.values.shape[0]:
             tree_limit = self.model.values.shape[0]
-        # convert dataframes
+        # convert dataframes (use to_numpy to handle pandas nullable dtypes like Int64/Float64)
         if isinstance(X, (pd.Series, pd.DataFrame)):
-            X = X.values
+            X = X.to_numpy(dtype=self.model.input_dtype, na_value=np.nan)
         flat_output = False
         if len(X.shape) == 1:
             flat_output = True
@@ -447,17 +502,17 @@ class TreeExplainer(Explainer):
             )
             check_additivity = False
 
-        return X, y, X_missing, flat_output, tree_limit, check_additivity
+        return X, y, X_missing, flat_output, tree_limit, check_additivity  # type: ignore[return-value]
 
     def shap_values(
         self,
         X: Any,
-        y: np.ndarray | pd.Series | None = None,
+        y: npt.NDArray[Any] | pd.Series | None = None,
         tree_limit: int | None = None,
         approximate: bool = False,
         check_additivity: bool = True,
         from_call: bool = False,
-    ):
+    ) -> npt.NDArray[Any]:
         """Estimate the SHAP values for a set of samples.
 
         Parameters
@@ -489,15 +544,33 @@ class TreeExplainer(Explainer):
         np.array
             Estimated SHAP values, usually of shape ``(# samples x # features)``.
 
-            Each row sums to the difference between the model output for that
-            sample and the expected value of the model output (which is stored
-            as the ``expected_value`` attribute of the explainer).
+            For each output, the SHAP values (summed across all features) plus the
+            expected value equals the model's output for that sample:
+
+            * Single output: ``shap_values[i, :].sum() + expected_value = model_output[i]``
+            * Multiple outputs: ``shap_values[i, :, j].sum() + expected_value[j] = model_output[i, j]``
 
             The shape of the returned array depends on the number of model outputs:
 
             * one output: array of shape ``(#num_samples, *X.shape[1:])``.
             * multiple outputs: array of shape ``(#num_samples, *X.shape[1:],
               #num_outputs)``.
+
+            **Examples:**
+
+            * **Regression:** A ``RandomForestRegressor`` returns SHAP values of shape
+              ``(#num_samples, #num_features)`` with a scalar ``expected_value``.
+
+            * **Binary classification:** Output behavior varies by model:
+
+              - **Scikit-learn models** (e.g., ``RandomForestClassifier``) output
+                probabilities for both classes, resulting in SHAP values of shape
+                ``(#num_samples, #num_features, 2)`` and ``expected_value`` as an
+                array of length 2.
+
+              - **XGBoost and LightGBM** (with default ``model_output="raw"``) output
+                a single value (raw margin/log-odds), resulting in SHAP values of shape
+                ``(#num_samples, #num_features)`` and ``expected_value`` as a scalar.
 
             .. versionchanged:: 0.45.0
                 Return type for models with multiple outputs changed from list to np.ndarray.
@@ -539,7 +612,10 @@ class TreeExplainer(Explainer):
                 assert not approximate, "approximate=True is not supported for LightGBM models!"
                 phi = self.model.original_model.predict(X, num_iteration=tree_limit, pred_contrib=True)
                 # Note: the data must be joined on the last axis
-                if self.model.original_model.params["objective"] == "binary":
+                if (
+                    "objective" in self.model.original_model.params
+                    and self.model.original_model.params["objective"] == "binary"
+                ):
                     if not from_call:
                         warnings.warn(
                             "LightGBM binary classifier with TreeExplainer shap values output has changed to a list of ndarray"
@@ -575,8 +651,8 @@ class TreeExplainer(Explainer):
                 if check_additivity and model_output_vals is not None:
                     self.assert_additivity(out, model_output_vals)
                 if isinstance(out, list):
-                    out = np.stack(out, axis=-1)
-                return out
+                    out = np.stack(out, axis=-1)  # type: ignore[assignment]
+                return out  # type: ignore[return-value]
 
         X, y, X_missing, flat_output, tree_limit, check_additivity = self._validate_inputs(
             X, y, tree_limit, check_additivity
@@ -595,6 +671,7 @@ class TreeExplainer(Explainer):
                 self.model.children_default,
                 self.model.features,
                 self.model.thresholds,
+                self.model.threshold_types,
                 self.model.values,
                 self.model.node_sample_weight,
                 self.model.max_depth,
@@ -617,6 +694,7 @@ class TreeExplainer(Explainer):
                 self.model.children_default,
                 self.model.features,
                 self.model.thresholds,
+                self.model.threshold_types,
                 self.model.values,
                 self.model.max_depth,
                 tree_limit,
@@ -630,16 +708,16 @@ class TreeExplainer(Explainer):
 
         out = self._get_shap_output(phi, flat_output)
         if check_additivity and self.model.model_output == "raw":
-            self.assert_additivity(out, self.model.predict(X))
+            self.assert_additivity(out, self.model.predict(X))  # type: ignore[arg-type]
 
         # This statements handles the case of multiple outputs
         # e.g. a multi-class classification problem, multi-target regression problem
         # in this case the output shape corresponds to [num_samples, num_features, num_outputs]
         if isinstance(out, list):
-            out = np.stack(out, axis=-1)
-        return out
+            out = np.stack(out, axis=-1)  # type: ignore[assignment]
+        return out  # type: ignore[return-value]
 
-    def _get_shap_output(self, phi, flat_output):
+    def _get_shap_output(self, phi: npt.NDArray[Any], flat_output: bool) -> Any:
         """Pull off the last column of ``phi`` and keep it as our expected_value."""
         if self.model.num_outputs == 1:
             if self.expected_value is None and self.model.model_output != "log_loss":
@@ -652,16 +730,21 @@ class TreeExplainer(Explainer):
             if self.expected_value is None and self.model.model_output != "log_loss":
                 self.expected_value = [phi[0, -1, i] for i in range(phi.shape[2])]
             if flat_output:
-                out = [phi[0, :-1, i] for i in range(self.model.num_outputs)]
+                out = [phi[0, :-1, i] for i in range(self.model.num_outputs)]  # type: ignore[assignment]
             else:
-                out = [phi[:, :-1, i] for i in range(self.model.num_outputs)]
+                out = [phi[:, :-1, i] for i in range(self.model.num_outputs)]  # type: ignore[assignment]
 
         # if our output format requires binary classification to be represented as two outputs then we do that here
         if self.model.model_output == "probability_doubled":
-            out = [-out, out]
+            out = [-out, out]  # type: ignore[assignment]
         return out
 
-    def shap_interaction_values(self, X, y=None, tree_limit=None):
+    def shap_interaction_values(
+        self,
+        X: npt.NDArray[Any] | pd.DataFrame | Any,
+        y: npt.NDArray[Any] | pd.Series | None = None,
+        tree_limit: int | None = None,
+    ) -> npt.NDArray[Any]:
         """Estimate the SHAP interaction values for a set of samples.
 
         Parameters
@@ -741,7 +824,7 @@ class TreeExplainer(Explainer):
             # note we pull off the last column and keep it as our expected_value
             if len(phi.shape) == 4:
                 self.expected_value = getattr(self, "expected_value", [phi[0, i, -1, -1] for i in range(phi.shape[1])])
-                return [phi[:, i, :-1, :-1] for i in range(phi.shape[1])]
+                return [phi[:, i, :-1, :-1] for i in range(phi.shape[1])]  # type: ignore[return-value]
             else:
                 self.expected_value = getattr(self, "expected_value", phi[0, -1, -1])
                 return phi[:, :-1, :-1]
@@ -756,6 +839,7 @@ class TreeExplainer(Explainer):
             self.model.children_default,
             self.model.features,
             self.model.thresholds,
+            self.model.threshold_types,
             self.model.values,
             self.model.node_sample_weight,
             self.model.max_depth,
@@ -774,7 +858,7 @@ class TreeExplainer(Explainer):
 
         return self._get_shap_interactions_output(phi, flat_output)
 
-    def _get_shap_interactions_output(self, phi, flat_output):
+    def _get_shap_interactions_output(self, phi: npt.NDArray[Any], flat_output: bool) -> npt.NDArray[Any]:
         """Pull off the last column and keep it as our expected_value"""
         if self.model.num_outputs == 1:
             # get expected value only if not already set
@@ -791,8 +875,8 @@ class TreeExplainer(Explainer):
                 out = np.stack([phi[:, :-1, :-1, i] for i in range(self.model.num_outputs)], axis=-1)
         return out
 
-    def assert_additivity(self, phi, model_output):
-        def check_sum(sum_val, model_output):
+    def assert_additivity(self, phi: npt.NDArray[Any] | list[npt.NDArray[Any]], model_output: npt.NDArray[Any]) -> None:
+        def check_sum(sum_val: npt.NDArray[Any], model_output: npt.NDArray[Any]) -> None:
             diff = np.abs(sum_val - model_output)
             # TODO: add arguments for passing custom 'atol' and 'rtol' values to 'np.allclose'
             # would require change to interface i.e. '__call__' methods
@@ -819,7 +903,7 @@ class TreeExplainer(Explainer):
             check_sum(self.expected_value + phi.sum(-1), model_output)
 
     @staticmethod
-    def supports_model_with_masker(model, masker):
+    def supports_model_with_masker(model: Any, masker: Any) -> bool:
         """Determines if this explainer can handle the given model.
 
         This is an abstract static method meant to be implemented by each subclass.
@@ -840,7 +924,41 @@ class TreeEnsemble:
     This object provides a common interface to many different types of models.
     """
 
-    def __init__(self, model, data=None, data_missing=None, model_output=None):
+    model_type: str
+    trees: list[SingleTree] | None
+    base_offset: Any
+    model_output: str | None
+    objective: str | None
+    tree_output: str | None
+    internal_dtype: type[np.floating[Any]]
+    input_dtype: type[np.floating[Any]]
+    data: npt.NDArray[Any] | None
+    data_missing: npt.NDArray[np.bool_] | None
+    fully_defined_weighting: bool
+    tree_limit: int | None
+    num_stacked_models: int
+    cat_feature_indices: npt.NDArray[Any] | None
+    original_model: Any
+    children_left: npt.NDArray[np.int32]
+    children_right: npt.NDArray[np.int32]
+    children_default: npt.NDArray[np.int32]
+    features: npt.NDArray[np.int32]
+    thresholds: npt.NDArray[Any]
+    threshold_types: npt.NDArray[np.int32]
+    values: npt.NDArray[Any]
+    node_sample_weight: npt.NDArray[Any]
+    num_nodes: npt.NDArray[np.int32]
+    max_depth: int
+    _xgboost_n_outputs: int
+    _xgb_dmatrix_props: dict[str, Any]
+
+    def __init__(
+        self,
+        model: Any,
+        data: npt.NDArray[Any] | None = None,
+        data_missing: npt.NDArray[np.bool_] | None = None,
+        model_output: str | None = None,
+    ) -> None:
         self.model_type = "internal"
         self.trees = None
         self.base_offset = 0
@@ -912,6 +1030,7 @@ class TreeEnsemble:
                 "sklearn.ensemble.RandomForestRegressor",
                 "sklearn.ensemble.forest.RandomForestRegressor",
                 "econml.grf._base_grf.BaseGRF",
+                "causalml.inference.tree.CausalRandomForestRegressor",
             ],
         ):
             assert hasattr(model, "estimators_"), "Model has no `estimators_`! Have you called `model.fit`?"
@@ -969,6 +1088,7 @@ class TreeEnsemble:
                 "sklearn.tree.DecisionTreeRegressor",
                 "sklearn.tree.tree.DecisionTreeRegressor",
                 "econml.grf._base_grftree.GRFTree",
+                "causalml.inference.tree.causal.causaltree.CausalTreeRegressor",
             ],
         ):
             self.internal_dtype = model.tree_.value.dtype.type
@@ -1377,7 +1497,7 @@ class TreeEnsemble:
             for idx, shap_tree in enumerate(shap_trees):
                 tree_ = shap_tree.tree_
                 values = tree_.value.reshape(tree_.value.shape[0], tree_.value.shape[1] * tree_.value.shape[2])
-                values = values * scaling[idx]
+                values = values * scaling[idx]  # type: ignore[index]
                 tree = {
                     "children_left": tree_.children_left.astype(np.int32),
                     "children_right": tree_.children_right.astype(np.int32),
@@ -1408,6 +1528,7 @@ class TreeEnsemble:
             self.features = -np.ones((num_trees, max_nodes), dtype=np.int32)
 
             self.thresholds = np.zeros((num_trees, max_nodes), dtype=self.internal_dtype)
+            self.threshold_types = np.zeros((num_trees, max_nodes), dtype=np.int32)
             self.values = np.zeros((num_trees, max_nodes, self.num_outputs), dtype=self.internal_dtype)
             self.node_sample_weight = np.zeros((num_trees, max_nodes), dtype=self.internal_dtype)
 
@@ -1417,6 +1538,7 @@ class TreeEnsemble:
                 self.children_default[i, : len(self.trees[i].children_default)] = self.trees[i].children_default
                 self.features[i, : len(self.trees[i].features)] = self.trees[i].features
                 self.thresholds[i, : len(self.trees[i].thresholds)] = self.trees[i].thresholds
+                self.threshold_types[i, : len(self.trees[i].threshold_types)] = self.trees[i].threshold_types
 
                 # XGBoost supports boosting forest, which is not compatible with the
                 # current assumption here that the number of stacked models represents
@@ -1448,11 +1570,11 @@ class TreeEnsemble:
 
     def _set_xgboost_model_attributes(
         self,
-        data,
-        data_missing,
-        objective_name_map,
-        tree_output_name_map,
-    ):
+        data: npt.NDArray[Any] | None,
+        data_missing: npt.NDArray[np.bool_] | None,
+        objective_name_map: dict[str, str],
+        tree_output_name_map: dict[str, str],
+    ) -> None:
         self.model_type = "xgboost"
         loader = XGBTreeModelLoader(self.original_model)
 
@@ -1480,15 +1602,15 @@ class TreeEnsemble:
             return self._xgboost_n_outputs
 
         if self.num_stacked_models > 1:
-            if len(self.trees) % self.num_stacked_models != 0:
+            if len(self.trees) % self.num_stacked_models != 0:  # type: ignore[arg-type]
                 raise ValueError("Only stacked models with equal numbers of trees are supported!")
-            if self.trees[0].values.shape[1] != 1:
+            if self.trees[0].values.shape[1] != 1:  # type: ignore[index]
                 raise ValueError("Only stacked models with single outputs per model are supported!")
             return self.num_stacked_models
         else:
-            return self.trees[0].values.shape[1]
+            return self.trees[0].values.shape[1]  # type: ignore[index]
 
-    def get_transform(self):
+    def get_transform(self) -> str:
         """A consistent interface to make predictions from this model."""
         if self.model_output == "raw":
             transform = "identity"
@@ -1520,7 +1642,13 @@ class TreeEnsemble:
 
         return transform
 
-    def predict(self, X, y=None, output=None, tree_limit=None):
+    def predict(
+        self,
+        X: npt.NDArray[Any] | pd.Series | pd.DataFrame,
+        y: npt.NDArray[Any] | None = None,
+        output: str | None = None,
+        tree_limit: int | None = None,
+    ) -> npt.NDArray[Any] | float:
         """A consistent interface to make predictions from this model.
 
         Parameters
@@ -1547,9 +1675,9 @@ class TreeEnsemble:
         if tree_limit is None:
             tree_limit = -1 if self.tree_limit is None else self.tree_limit
 
-        # convert dataframes
+        # convert dataframes (use to_numpy to handle pandas nullable dtypes like Int64/Float64)
         if isinstance(X, (pd.Series, pd.DataFrame)):
-            X = X.values
+            X = X.to_numpy(dtype=self.input_dtype, na_value=np.nan)
         flat_output = False
         if len(X.shape) == 1:
             flat_output = True
@@ -1576,13 +1704,14 @@ class TreeEnsemble:
 
         transform = self.get_transform()
         assert_import("cext")
-        output = np.zeros((X.shape[0], self.num_outputs))
+        output_array: npt.NDArray[Any] = np.zeros((X.shape[0], self.num_outputs))
         _cext.dense_tree_predict(
             self.children_left,
             self.children_right,
             self.children_default,
             self.features,
             self.thresholds,
+            self.threshold_types,
             self.values,
             self.max_depth,
             tree_limit,
@@ -1591,20 +1720,20 @@ class TreeEnsemble:
             X,
             X_missing,
             y,
-            output,
+            output_array,
         )
 
         # drop dimensions we don't need
         if flat_output:
             if self.num_outputs == 1:
-                return output.flatten()[0]
+                return output_array.flatten()[0]
             else:
-                return output.reshape(-1, self.num_outputs)
+                return output_array.reshape(-1, self.num_outputs)
         else:
             if self.num_outputs == 1:
-                return output.flatten()
+                return output_array.flatten()
             else:
-                return output
+                return output_array
 
 
 class SingleTree:
@@ -1653,10 +1782,34 @@ class SingleTree:
 
     """
 
-    def __init__(self, tree, normalize=False, scaling=1.0, data=None, data_missing=None):
+    children_left: npt.NDArray[np.int32]
+    children_right: npt.NDArray[np.int32]
+    children_default: npt.NDArray[np.int32]
+    features: npt.NDArray[np.int32]
+    thresholds: npt.NDArray[np.float64]
+    threshold_types: npt.NDArray[np.int32]
+    values: npt.NDArray[Any]
+    node_sample_weight: npt.NDArray[np.float64]
+    max_depth: int
+
+    def __init__(
+        self,
+        tree: Any,
+        normalize: bool = False,
+        scaling: float = 1.0,
+        data: npt.NDArray[Any] | None = None,
+        data_missing: npt.NDArray[np.bool_] | None = None,
+    ) -> None:
         assert_import("cext")
 
-        if safe_isinstance(tree, ["sklearn.tree._tree.Tree", "econml.tree._tree.Tree"]):
+        if safe_isinstance(
+            tree,
+            [
+                "sklearn.tree._tree.Tree",
+                "econml.tree._tree.Tree",
+                "causalml.inference.tree._tree._tree.Tree",
+            ],
+        ):
             self.children_left = tree.children_left.astype(np.int32)
             self.children_right = tree.children_right.astype(np.int32)
             self.children_default = self.children_left
@@ -1664,6 +1817,7 @@ class SingleTree:
                 self.children_default = np.where(tree.missing_go_to_left, self.children_left, self.children_right)
             self.features = tree.feature.astype(np.int32)
             self.thresholds = tree.threshold.astype(np.float64)
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
             self.values = tree.value.reshape(tree.value.shape[0], tree.value.shape[1] * tree.value.shape[2])
             if normalize:
                 self.values = (self.values.T / self.values.sum(1)).T
@@ -1676,6 +1830,7 @@ class SingleTree:
             self.children_default = tree["children_default"].astype(np.int32)
             self.features = tree["features"].astype(np.int32)
             self.thresholds = tree["thresholds"]
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
             self.values = tree["values"] * scaling
             self.node_sample_weight = tree["node_sample_weight"]
 
@@ -1686,6 +1841,7 @@ class SingleTree:
             self.children_default = tree["children_default"].astype(np.int32)
             self.features = tree["feature"].astype(np.int32)
             self.thresholds = tree["threshold"]
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
             self.values = tree["value"] * scaling
             self.node_sample_weight = tree["node_sample_weight"]
 
@@ -1711,7 +1867,8 @@ class SingleTree:
             self.children_default = np.full(num_nodes, -2, dtype=np.int32)
             self.features = np.full(num_nodes, -2, dtype=np.int32)
             self.thresholds = np.full(num_nodes, -2, dtype=np.float64)
-            self.values = [-2] * num_nodes
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
+            self.values = [-2] * num_nodes  # type: ignore[assignment]
             self.node_sample_weight = np.full(num_nodes, -2, dtype=np.float64)
 
             def buildTree(index, node):
@@ -1763,7 +1920,8 @@ class SingleTree:
             self.children_default = np.empty(num_nodes, dtype=np.int32)
             self.features = np.empty(num_nodes, dtype=np.int32)
             self.thresholds = np.empty(num_nodes, dtype=np.float64)
-            self.values = [-2 for _ in range(num_nodes)]
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
+            self.values = [-2 for _ in range(num_nodes)]  # type: ignore[assignment]
             self.node_sample_weight = np.empty(num_nodes, dtype=np.float64)
 
             # BFS traversal through the tree structure
@@ -1794,7 +1952,18 @@ class SingleTree:
                         self.children_default[vsplit_idx] = self.children_right[vsplit_idx]
 
                     self.features[vsplit_idx] = vertex["split_feature"]
-                    self.thresholds[vsplit_idx] = vertex["threshold"]
+                    if isinstance(vertex["threshold"], (int, float)):
+                        self.thresholds[vsplit_idx] = vertex["threshold"]
+                        self.threshold_types[vsplit_idx] = 0
+                    elif isinstance(vertex["threshold"], str):
+                        threshold = 0.0
+                        categories = [int(x) for x in vertex["threshold"].split("||")]
+                        for cat in categories:
+                            threshold += 2 ** (cat - 1)
+                        self.thresholds[vsplit_idx] = threshold
+                        self.threshold_types[vsplit_idx] = 1  # Indicates that this is a categorical split
+                    else:
+                        raise TypeError(f"Threshold type {type(vertex['threshold'])} not supported")
                     self.values[vsplit_idx] = [vertex["internal_value"]]
                     self.node_sample_weight[vsplit_idx] = vertex["internal_count"]
                     visited.append(vsplit_idx)
@@ -1813,12 +1982,13 @@ class SingleTree:
                     self.children_default[vleaf_idx] = -1
                     self.features[vleaf_idx] = -1
                     self.thresholds[vleaf_idx] = -1
+                    self.threshold_types[vleaf_idx] = -1
                     self.values[vleaf_idx] = [vertex["leaf_value"]]
                     # FIXME: "leaf_count" currently doesn't exist if we have a stump tree.
                     # We should be technically be assigning the number of samples used to
                     # train the model as the weight here, but unfortunately this info is
                     # currently unavailable in `tree`, so we set to 0 first.
-                    # cf. https://github.com/microsoft/LightGBM/issues/5962
+                    # cf. https://github.com/lightgbm-org/LightGBM/issues/5962
                     self.node_sample_weight[vleaf_idx] = vertex.get("leaf_count", 0)
             self.values = np.asarray(self.values)
             self.values = np.multiply(self.values, scaling)
@@ -1839,6 +2009,7 @@ class SingleTree:
             self.children_default = -np.ones(m, dtype=np.int32)
             self.features = -np.ones(m, dtype=np.int32)
             self.thresholds = np.zeros(m, dtype=np.float64)
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
             self.values = np.zeros((m, 1), dtype=np.float64)
             self.node_sample_weight = np.empty(m, dtype=np.float64)
 
@@ -1911,7 +2082,8 @@ class SingleTree:
             self.children_right = children_right
             self.children_default = children_default
             self.features = features
-            self.thresholds = thresholds
+            self.thresholds = thresholds  # type: ignore[assignment]
+            self.threshold_types = np.zeros_like(self.thresholds, dtype=np.int32)
             self.values = values[:, np.newaxis] * scaling
             self.node_sample_weight = node_sample_weight
         else:
@@ -1926,12 +2098,34 @@ class SingleTree:
                 self.children_default,
                 self.features,
                 self.thresholds,
+                self.threshold_types,
                 self.values,
                 1,
                 self.node_sample_weight,
                 data,
                 data_missing,
             )
+
+            # Fix for zero-weight nodes causing NaN in path-dependent SHAP.
+            #
+            # Original issue: when a background dataset doesn't cover all
+            # leaves, the fully_defined_weighting check raises ExplainerError,
+            # blocking path-dependent mode entirely (#3574).
+            #
+            # Root cause: tree_shap_recursive's unwind_path() divides by
+            # zero_fraction. When a leaf has zero background coverage (w=0),
+            # samples routing through that subtree encounter zero_fraction=0
+            # on cold paths, producing NaN via 0/0. This also occurs with
+            # full training data as background due to floating-point
+            # threshold comparison mismatches in tree_update_weights vs the
+            # original model training.
+            #
+            # Fix: replace zero weights with epsilon (1e-6) so uncovered
+            # nodes have negligible but non-zero probability. Additivity
+            # holds to <1e-7 and values converge as background size grows.
+            zero_mask = self.node_sample_weight == 0.0
+            if zero_mask.any():
+                self.node_sample_weight[zero_mask] = 1e-6
 
         # we compute the expectations to make sure they follow the SHAP logic
         self.max_depth = _cext.compute_expectations(
@@ -1942,7 +2136,15 @@ class SingleTree:
 class IsoTree(SingleTree):
     """In sklearn the tree of the Isolation Forest does not calculated in a good way."""
 
-    def __init__(self, tree, tree_features, normalize=False, scaling=1.0, data=None, data_missing=None):
+    def __init__(
+        self,
+        tree: Any,
+        tree_features: npt.NDArray[Any],
+        normalize: bool = False,
+        scaling: float = 1.0,
+        data: npt.NDArray[Any] | None = None,
+        data_missing: npt.NDArray[np.bool_] | None = None,
+    ) -> None:
         super().__init__(tree, normalize, scaling, data, data_missing)
         if safe_isinstance(tree, "sklearn.tree._tree.Tree"):
             from sklearn.ensemble._iforest import _average_path_length
@@ -1966,7 +2168,7 @@ class IsoTree(SingleTree):
             self.features = np.where(self.features >= 0, tree_features[self.features], self.features)
 
 
-def get_xgboost_dmatrix_properties(model):
+def get_xgboost_dmatrix_properties(model: Any) -> dict[str, Any]:
     """Retrieves properties from an xgboost.sklearn.XGBModel instance that should be
     passed to the xgboost.core.DMatrix object before calling predict on the model.
 
@@ -1986,7 +2188,29 @@ def get_xgboost_dmatrix_properties(model):
 class XGBTreeModelLoader:
     """This loads an XGBoost model directly from a raw memory dump."""
 
-    def __init__(self, xgb_model) -> None:
+    n_trees_per_iter: int
+    n_targets: int
+    name_obj: str
+    name_gbm: str
+    base_score: float
+    num_feature: int
+    num_class: int
+    num_trees: int
+    node_parents: list[npt.NDArray[Any]]
+    node_cleft: list[npt.NDArray[np.int32]]
+    node_cright: list[npt.NDArray[np.int32]]
+    node_sindex: list[npt.NDArray[np.uint32]]
+    children_default: list[npt.NDArray[Any]]
+    sum_hess: list[npt.NDArray[np.float64]]
+    values: list[npt.NDArray[Any]]
+    thresholds: list[npt.NDArray[Any]]
+    threshold_types: list[npt.NDArray[np.int32]]
+    features: list[npt.NDArray[Any]]
+    split_types: list[npt.NDArray[Any]]
+    categories: list[list[list[int]]]
+    cat_feature_indices: npt.NDArray[Any] | None
+
+    def __init__(self, xgb_model: Any) -> None:
         import xgboost as xgb
 
         _check_xgboost_version(xgb.__version__)
@@ -2024,13 +2248,24 @@ class XGBTreeModelLoader:
         # Accounts for number of classes, targets, forest size.
         self.n_trees_per_iter = int(diff[0])
         self.n_targets = n_targets
-        self.base_score = float(learner_model_param["base_score"])
         assert self.n_trees_per_iter > 0
 
         self.name_obj = objective["name"]
         self.name_gbm = booster["name"]
         # handle the link function.
-        base_score = float(learner_model_param["base_score"])
+        base_score = learner_model_param["base_score"]
+        if isinstance(base_score, str):
+            try:
+                base_score = ast.literal_eval(base_score)
+                if not isinstance(base_score, (list, float, int, tuple, np.ndarray)):
+                    raise ValueError
+            except ValueError as e:
+                emsg = f"Expected the base_score to contain a list or float, received {base_score}"
+                raise ValueError(emsg) from e
+        if isinstance(base_score, (list, tuple, np.ndarray)):
+            base_score = base_score[0]
+        base_score = float(base_score)
+        self.base_score = base_score
         if self.name_obj in ("binary:logistic", "reg:logistic"):
             self.base_score = scipy.special.logit(base_score)
         elif self.name_obj in (
@@ -2060,6 +2295,7 @@ class XGBTreeModelLoader:
 
         self.values = []
         self.thresholds = []
+        self.threshold_types = []
         self.features = []
 
         # Categorical features, not supported by the SHAP package yet.
@@ -2108,9 +2344,11 @@ class XGBTreeModelLoader:
             # Xgboost uses < for thresholds where shap uses <= Move the threshold down
             # by the smallest possible increment
             thresholds = np.where(is_leaf, 0.0, np.nextafter(thresholds, -np.float32(np.inf)))
+            threshold_types = np.zeros_like(thresholds, dtype=np.int32)
 
             self.values.append(leaf_weight.reshape(leaf_weight.size, 1))
             self.thresholds.append(thresholds)
+            self.threshold_types.append(threshold_types)
 
             split_idx = np.asarray(tree["split_indices"], dtype=np.int64)
             self.features.append(split_idx)
@@ -2137,7 +2375,7 @@ class XGBTreeModelLoader:
         cat_segments: list[int],
         cat_sizes: list[int],
         cats: list[int],
-        left_children: np.ndarray,
+        left_children: npt.NDArray[Any],
     ) -> list[list[int]]:
         """Parse the JSON model to extract partitions of categories for each
         node. Returns a list, in which each element is a list of categories for tree
@@ -2176,7 +2414,11 @@ class XGBTreeModelLoader:
                 node_categories.append([])
         return node_categories
 
-    def get_trees(self, data=None, data_missing=None) -> list[SingleTree]:
+    def get_trees(
+        self,
+        data: npt.NDArray[Any] | None = None,
+        data_missing: npt.NDArray[np.bool_] | None = None,
+    ) -> list[SingleTree]:
         trees = []
         for i in range(self.num_trees):
             info = {
@@ -2185,6 +2427,7 @@ class XGBTreeModelLoader:
                 "children_default": self.children_default[i],
                 "feature": self.features[i],
                 "threshold": self.thresholds[i],
+                "threshold_type": self.threshold_types[i],
                 "value": self.values[i],
                 "node_sample_weight": self.sum_hess[i],
             }
@@ -2204,7 +2447,11 @@ class XGBTreeModelLoader:
 
 
 class CatBoostTreeModelLoader:
-    def __init__(self, cb_model):
+    loaded_cb_model: dict[str, Any]
+    num_trees: int
+    max_depth: int
+
+    def __init__(self, cb_model: Any) -> None:
         import tempfile
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2217,7 +2464,11 @@ class CatBoostTreeModelLoader:
         self.num_trees = len(self.loaded_cb_model["oblivious_trees"])
         self.max_depth = self.loaded_cb_model["model_info"]["params"]["tree_learner_options"]["depth"]
 
-    def get_trees(self, data=None, data_missing=None):
+    def get_trees(
+        self,
+        data: npt.NDArray[Any] | None = None,
+        data_missing: npt.NDArray[np.bool_] | None = None,
+    ) -> list[SingleTree]:
         # load each tree
         trees = []
         for tree_index in range(self.num_trees):
